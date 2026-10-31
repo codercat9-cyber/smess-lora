@@ -25,8 +25,10 @@ static mt_parser parser;
 static uint8_t tx[MT_MAX_PAYLOAD + 4];
 
 static enum { ST_WAKE, ST_CONFIG, ST_READY } state;
-static uint32_t t_state, config_id, my_num, t_heartbeat;
+static uint32_t t_state, config_id, prev_config_id, my_num, t_heartbeat;
 static uint32_t channel;
+/* Диагностика связи с узлом: видно, доходят ли байты и собираются ли кадры */
+static uint32_t rx_bytes, rx_frames, rx_bad;
 static uint32_t dest = MT_BROADCAST;
 
 static mt_node nodes[APP_MAX_NODES];
@@ -126,6 +128,7 @@ static void wake(void) {
 }
 
 static void request_config(void) {
+    prev_config_id = config_id;
     config_id = new_id();
     size_t n = mt_frame_want_config(tx, sizeof tx, config_id);
     P->radio_write(tx, n);
@@ -162,7 +165,10 @@ static void on_packet(const mt_packet *p) {
 
 static void on_frame(const uint8_t *buf, size_t len) {
     mt_fromradio fr;
-    if (!mt_decode_fromradio(buf, len, &fr)) return;
+    rx_frames++;
+    if (!mt_decode_fromradio(buf, len, &fr)) { rx_bad++; return; }
+    /* Узел ещё льёт настройки — перезапрос подождёт */
+    if (state == ST_CONFIG) t_state = P->millis();
     switch (fr.kind) {
     case MT_FR_MY_INFO:
         my_num = fr.my_node_num;
@@ -172,7 +178,11 @@ static void on_frame(const uint8_t *buf, size_t len) {
         node_upsert(&fr.node);
         break;
     case MT_FR_CONFIG_COMPLETE:
-        if (fr.config_complete_id != config_id || state == ST_READY) break;
+        /* Засчитываем и ответ на предыдущий запрос: на большой сети узел
+         * шлёт настройки дольше паузы перезапроса, и раньше ответ на старый
+         * номер отбрасывался — клиент перезапрашивал по кругу (поймано в
+         * эмуляторе STM32 на сети в 200 узлов). */
+        if ((fr.config_complete_id != config_id && fr.config_complete_id != prev_config_id) || state == ST_READY) break;
         state = ST_READY;
         t_heartbeat = P->millis();
         {
@@ -295,6 +305,7 @@ static void cmd_info(void) {
         state == ST_READY ? "на связи" : "подключаюсь", (unsigned long)channel,
         dest == MT_BROADCAST ? "все" : node_name(dest, nb));
     say("Шифрование содержимого: %s\n", smesh_crypto_name());
+    say("От узла: %lu байт, %lu кадров, битых %lu\n", (unsigned long)rx_bytes, (unsigned long)rx_frames, (unsigned long)rx_bad);
     say("Сообщение: до %u байт (%u кадр. по %u)\n", (unsigned)(SMESH_MAX_MSG - smesh_crypto_overhead()),
         SMESH_MAX_FRAGS, SMESH_FRAG_BODY);
 }
@@ -360,6 +371,7 @@ void app_init(const smess_platform *p) {
 }
 
 void app_radio_byte(uint8_t b) {
+    rx_bytes++;
     int n = mt_parser_feed(&parser, b);
     if (n > 0) on_frame(parser.buf, (size_t)n);
 }

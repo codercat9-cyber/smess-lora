@@ -50,14 +50,18 @@ void sys_tick_handler(void) {
     ms++;
 }
 
-/* Чтение DR снимает и RXNE, и переполнение (ORE) — иначе прерывание залипнет */
-void usart2_isr(void) {
-    if (USART_SR(USART2) & (USART_SR_RXNE | USART_SR_ORE)) ring_put(&radio_rx, (uint8_t)usart_recv(USART2));
+/* Чтение SR, затем DR снимает и RXNE, и ошибки (ORE/NE/FE). DR читаем
+ * ВСЕГДА: если прерывание взвелось без RXNE (ошибка линии, особенности
+ * модели), без чтения оно не снимется и обработчик будет вызываться по
+ * кругу, а основной цикл встанет — поймано в эмуляторе Renode. */
+static void usart_rx(uint32_t usart, ring_t *ring) {
+    uint32_t sr = USART_SR(usart);
+    uint8_t b = (uint8_t)USART_DR(usart);
+    if (sr & USART_SR_RXNE) ring_put(ring, b);
 }
 
-void usart1_isr(void) {
-    if (USART_SR(USART1) & (USART_SR_RXNE | USART_SR_ORE)) ring_put(&console_rx, (uint8_t)usart_recv(USART1));
-}
+void usart2_isr(void) { usart_rx(USART2, &radio_rx); }
+void usart1_isr(void) { usart_rx(USART1, &console_rx); }
 
 static void radio_write(const uint8_t *d, size_t n) {
     while (n--) usart_send_blocking(USART2, *d++);
