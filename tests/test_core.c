@@ -250,14 +250,35 @@ static void test_app(void) {
     pbw_bytes(&u, 3, "peer", 4);
     pb_w n = { ni, sizeof ni, 0, false };
     pbw_uint(&n, 1, PEER);
+    pbw_fixed32(&n, 5, 1761999999u); /* слышали только что */
     pbw_bytes(&n, 2, user, u.len);
     node_says(4, ni, n.len);
+    /* Свой узел и толпа соседей сверх таблицы — как на живой сети в 200
+     * узлов. Свой не должен вытесниться (у него last_heard = 0). */
+    uint8_t self_user[64], self_ni[96];
+    pb_w su = { self_user, sizeof self_user, 0, false };
+    pbw_bytes(&su, 2, "Bimzh", 5);
+    pbw_bytes(&su, 3, "bmzh", 4);
+    pb_w sn = { self_ni, sizeof self_ni, 0, false };
+    pbw_uint(&sn, 1, ME);
+    pbw_bytes(&sn, 2, self_user, su.len);
+    node_says(4, self_ni, sn.len);
+    for (uint32_t k = 0; k < 60; k++) {
+        uint8_t crowd[32];
+        pb_w cw = { crowd, sizeof crowd, 0, false };
+        pbw_uint(&cw, 1, 0x100 + k);
+        pbw_fixed32(&cw, 5, 1761900000u + k);
+        node_says(4, crowd, cw.len);
+    }
+    node_says(4, ni, n.len); /* сосед «peer» — самый свежий */
+
     uint8_t cc[8];
     pb_w c = { cc, sizeof cc, 0, false };
     pbw_uint(&c, 7, cfg);
     feed_fromradio(cc, c.len);
     CHECK(app_ready());
     CHECK(strstr(console, "Готов") != NULL);
+    CHECK(strstr(console, "(bmzh)") != NULL); /* своё имя пережило вытеснение */
 
     /* Короткое сообщение лично соседу — один кадр PRIVATE_APP с want_ack */
     type_line("/to peer");

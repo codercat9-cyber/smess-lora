@@ -82,11 +82,13 @@ static void node_upsert(const mt_node *n) {
     mt_node *slot = node_find(n->num);
     if (!slot && n_nodes < APP_MAX_NODES) slot = &nodes[n_nodes++];
     if (!slot) {
-        /* Мест нет — вытесняем того, кого слышали давнее всех */
-        slot = &nodes[0];
-        for (unsigned i = 1; i < n_nodes; i++)
-            if (nodes[i].last_heard < slot->last_heard) slot = &nodes[i];
-        if (slot->last_heard > n->last_heard) return;
+        /* Мест нет — вытесняем того, кого слышали давнее всех. Свой узел
+         * не трогаем никогда: у него last_heard = 0, и раньше он вылетал
+         * первым — на живой сети в 200 узлов клиент забывал своё имя. */
+        for (unsigned i = 0; i < n_nodes; i++)
+            if (nodes[i].num != my_num && (!slot || nodes[i].last_heard < slot->last_heard)) slot = &nodes[i];
+        if (!slot) return;
+        if (n->num != my_num && slot->last_heard > n->last_heard) return;
     }
     *slot = *n;
 }
