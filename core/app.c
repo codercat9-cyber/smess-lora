@@ -34,15 +34,17 @@ static uint32_t dest = MT_BROADCAST;
 static mt_node nodes[APP_MAX_NODES];
 static unsigned n_nodes;
 
+static smesh_crypto_platform cplat; /* то, что дала платформа, + вывод для модуля */
+
 static smesh_rx rx;
 static uint8_t rx_msg[SMESH_MAX_MSG];
-static uint8_t rx_plain[SMESH_MAX_MSG];
+static uint8_t rx_plain[SMESH_MAX_MSG + 1]; /* +1 — завершающий ноль для вывода */
 
 static struct {
     bool busy;
     uint32_t to_node, msg_id, t_next;
     smesh_addr to;
-    uint8_t total, next;
+    uint8_t type, total, next;
     size_t len;
     uint8_t body[SMESH_MAX_MSG];
 } out;
@@ -60,6 +62,10 @@ static void say(const char *fmt, ...) {
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     P->console_write(buf);
+}
+
+static void say_line(const char *l) {
+    say("%s\n", l);
 }
 
 static bool due(uint32_t now, uint32_t t) {
@@ -155,12 +161,40 @@ static void on_packet(const mt_packet *p) {
 
     int n = smesh_rx_push(&rx, &f, P->millis(), rx_msg, sizeof rx_msg);
     if (n <= 0) return;
-    long m = smesh_open(&f.from, &f.to, rx_msg, (size_t)n, rx_plain, sizeof rx_plain);
-    if (m < 0) {
-        say("<- %s: [не открылось]\n", node_name(p->from, nb));
+    if (f.type == SMESH_T_CTRL) {
+        smesh_crypto_on_ctrl(p->from, &f, rx_msg, (size_t)n);
         return;
     }
-    say("<- %s%s: %.*s\n", node_name(p->from, nb), to_all ? " (всем)" : "", (int)m, (const char *)rx_plain);
+    smesh_trust trust;
+    long m = smesh_open(p->from, &f, rx_msg, (size_t)n, rx_plain, sizeof rx_plain - 1, &trust);
+    if (m < 0) {
+        say("<- %s: [не открылось%s]\n", node_name(p->from, nb),
+            (f.type & SMESH_T_SEALED) && !*smesh_crypto_id() ? " — защищено, нужна полная сборка" : "");
+        return;
+    }
+    char *text = (char *)rx_plain;
+    const char *kind = "";
+    if (f.type == SMESH_T_CHAT) {
+        /* Сообщение чата мессенджера: id чата и автора (2×16), время (6),
+         * хвост client_id; показываем только текст */
+        if (m < 39 || m < 39 + rx_plain[38]) return;
+        text += 39 + rx_plain[38];
+        m -= 39 + rx_plain[38];
+        kind = " [чат]";
+    } else if (f.type != SMESH_T_TEXT) {
+        return;
+    }
+    const char *mark = trust == SMESH_TRUST_PRIVATE ? " [лично, закрыто]"
+                     : trust == SMESH_TRUST_SIGNED ? " [подпись верна]"
+                     : *smesh_crypto_id() ? " [БЕЗ ПОДПИСИ]" : "";
+    say("<- %s%s%s%s: ", node_name(p->from, nb), to_all ? " (всем)" : "", kind, mark);
+    /* Текст — прямо в консоль, мимо say(): у неё буфер 320 байт, а сообщение
+     * бывает до SMESH_MAX_MSG (856 на Blue Pill, 1712 на Black Pill). Раньше
+     * длинное письмо обрывалось на экране на ~280-м байте, посреди буквы и
+     * без перевода строки (поймано в Renode). Как и %.*s — до первого нуля. */
+    text[m] = 0;
+    P->console_write(text);
+    say("\n");
 }
 
 static void on_frame(const uint8_t *buf, size_t len) {
@@ -172,7 +206,7 @@ static void on_frame(const uint8_t *buf, size_t len) {
     switch (fr.kind) {
     case MT_FR_MY_INFO:
         my_num = fr.my_node_num;
-        smesh_crypto_init(my_num);
+        smesh_crypto_init(&cplat, my_num);
         break;
     case MT_FR_NODE_INFO:
         node_upsert(&fr.node);
@@ -220,17 +254,26 @@ static void send_text(const char *text) {
         say("Предыдущее ещё уходит (%u из %u)\n", out.next, out.total);
         return;
     }
-    out.to = dest == MT_BROADCAST ? SMESH_ALL : smesh_crypto_peer(dest);
-    size_t len = smesh_seal(&out.to, (const uint8_t *)text, strlen(text), out.body, sizeof out.body);
+    if (dest == MT_BROADCAST) {
+        out.to = SMESH_ALL;
+    } else if (!smesh_crypto_peer(dest, &out.to)) {
+        char nb[16];
+        say("Ключ %s ещё не известен — попросил узел представиться. Повторите через минуту\n",
+            node_name(dest, nb));
+        return;
+    }
+    smesh_frame hdr = { SMESH_T_TEXT, new_id(), smesh_crypto_self(), out.to, 0, 1, NULL, 0 };
+    size_t len = smesh_seal(&hdr, (const uint8_t *)text, strlen(text), out.body, sizeof out.body);
     unsigned total = smesh_frag_count(len);
     if (!len || !total) {
         say("Слишком длинное: не больше %u байт\n",
-            (unsigned)(SMESH_MAX_MSG - smesh_crypto_overhead()));
+            (unsigned)(SMESH_MAX_MSG - smesh_crypto_overhead(dest == MT_BROADCAST)));
         return;
     }
     out.busy = true;
     out.to_node = dest;
-    out.msg_id = new_id();
+    out.msg_id = hdr.msg_id;
+    out.type = hdr.type;
     out.total = (uint8_t)total;
     out.next = 0;
     out.len = len;
@@ -241,7 +284,7 @@ static void pump_out(uint32_t now) {
     if (!out.busy || state != ST_READY || !due(now, out.t_next)) return;
     size_t off = (size_t)out.next * SMESH_FRAG_BODY;
     size_t blen = out.len - off < SMESH_FRAG_BODY ? out.len - off : SMESH_FRAG_BODY;
-    smesh_frame f = { SMESH_T_TEXT, out.msg_id, smesh_crypto_self(), out.to, out.next, out.total,
+    smesh_frame f = { out.type, out.msg_id, smesh_crypto_self(), out.to, out.next, out.total,
                       out.body + off, blen };
     uint8_t frame[MT_DATA_PAYLOAD_LEN];
     size_t fl = smesh_encode(frame, sizeof frame, &f);
@@ -258,6 +301,21 @@ static void pump_out(uint32_t now) {
         say("-> %s: отправлено (%u кадр.)\n",
             out.to_node == MT_BROADCAST ? "всем" : node_name(out.to_node, nb), out.total);
     }
+}
+
+/* Служебные кадры модуля защиты — между сообщениями, с той же паузой */
+static void pump_ctrl(uint32_t now) {
+    if (out.busy || state != ST_READY || !due(now, out.t_next)) return;
+    uint32_t to_node = MT_BROADCAST;
+    smesh_addr to = SMESH_ALL;
+    uint8_t body[SMESH_FRAG_BODY];
+    size_t n = smesh_crypto_ctrl_out(now, &to_node, &to, body, sizeof body);
+    if (!n) return;
+    smesh_frame f = { SMESH_T_CTRL, new_id(), smesh_crypto_self(), to, 0, 1, body, n };
+    uint8_t frame[MT_DATA_PAYLOAD_LEN];
+    size_t fl = smesh_encode(frame, sizeof frame, &f);
+    if (fl) radio_send(to_node, MT_PORT_PRIVATE, frame, fl);
+    out.t_next = now + FRAG_GAP_MS;
 }
 
 /* --- команды --- */
@@ -304,9 +362,10 @@ static void cmd_info(void) {
     say("Состояние: %s, канал %lu, адресат %s\n",
         state == ST_READY ? "на связи" : "подключаюсь", (unsigned long)channel,
         dest == MT_BROADCAST ? "все" : node_name(dest, nb));
-    say("Шифрование содержимого: %s\n", smesh_crypto_name());
+    say("Защита содержимого: %s\n", smesh_crypto_name());
+    if (*smesh_crypto_id()) say("Свой ключ: %s\n", smesh_crypto_id());
     say("От узла: %lu байт, %lu кадров, битых %lu\n", (unsigned long)rx_bytes, (unsigned long)rx_frames, (unsigned long)rx_bad);
-    say("Сообщение: до %u байт (%u кадр. по %u)\n", (unsigned)(SMESH_MAX_MSG - smesh_crypto_overhead()),
+    say("Сообщение: до %u байт (%u кадр. по %u)\n", (unsigned)(SMESH_MAX_MSG - smesh_crypto_overhead(false)),
         SMESH_MAX_FRAGS, SMESH_FRAG_BODY);
 }
 
@@ -331,6 +390,7 @@ static void process_line(char *s) {
             "  /info                 состояние\n"
             "Мессенджер не является СМИ: за содержание сообщений отвечает их автор.\n"
             "Запрещённое и опасное не размещайте. Мы за мир.\n");
+        smesh_crypto_command("help", NULL, say_line);
     } else if (!strcmp(s, "/nodes")) {
         cmd_nodes();
     } else if (!strcmp(s, "/info")) {
@@ -352,7 +412,7 @@ static void process_line(char *s) {
         else if (!arg || !*arg) say("Пустое сообщение\n");
         else if (strlen(arg) > MT_DATA_PAYLOAD_LEN) say("Не больше %u байт\n", MT_DATA_PAYLOAD_LEN);
         else if (radio_send(dest, MT_PORT_TEXT, (const uint8_t *)arg, strlen(arg))) say("-> [mesh] отправлено\n");
-    } else {
+    } else if (!smesh_crypto_command(s + 1, arg, say_line)) {
         say("Нет такой команды. /help\n");
     }
 }
@@ -361,22 +421,31 @@ static void process_line(char *s) {
 
 void app_init(const smess_platform *p) {
     P = p;
+    if (p->crypto) cplat = *p->crypto;
+    cplat.notice = say_line;
     mt_parser_init(&parser, on_radio_log, NULL);
     smesh_rx_init(&rx);
     memset(&out, 0, sizeof out);
     n_nodes = 0;
     line_len = 0;
     say("STORAGE&MESS LoRa — подключаюсь к узлу Meshtastic…\n");
+    /* Ключ — до разговора с узлом: первая запись во флеш останавливает
+     * процессор, и поток настроек узла оборвался бы на середине */
+    smesh_crypto_init(&cplat, 0);
     wake();
 }
 
 void app_radio_byte(uint8_t b) {
     rx_bytes++;
     int n = mt_parser_feed(&parser, b);
-    if (n > 0) on_frame(parser.buf, (size_t)n);
+    if (n > 0) {
+        smesh_crypto_stir(P->millis() ^ ((uint32_t)n << 20));
+        on_frame(parser.buf, (size_t)n);
+    }
 }
 
 void app_console_char(char c) {
+    smesh_crypto_stir(P->millis() ^ ((uint32_t)(uint8_t)c << 24));
     if (c == '\n' && last_cr) {
         last_cr = false;
         return;
@@ -421,6 +490,7 @@ void app_poll(void) {
         t_heartbeat = now;
     }
     pump_out(now);
+    pump_ctrl(now);
 }
 
 bool app_ready(void) {

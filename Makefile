@@ -12,7 +12,8 @@ CFLAGS  += -std=c99 -Wall -Wextra -Werror -Icore -D_DEFAULT_SOURCE
 # Закрытая — make CRYPTO=private, берётся private/crypto.c (не в репозитории).
 CRYPTO  ?= null
 ifeq ($(CRYPTO),private)
-CRYPTO_SRC := private/crypto.c
+CRYPTO_SRC := $(wildcard private/*.c private/vendor/*/*.c)
+CFLAGS     += $(addprefix -I,$(patsubst %/,%,$(wildcard private/vendor/*/)))
 else
 CRYPTO_SRC := core/crypto_null.c
 endif

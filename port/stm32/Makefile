@@ -3,6 +3,7 @@
 #   make                    — Black Pill, STM32F411CEU6
 #   make BOARD=bluepill     — Blue Pill, STM32F103C8T6
 #   make flash              — через ST-Link (st-flash) или OPENOCD=1
+#   make protect            — защита чтения (для полной сборки с ключом)
 #
 # Нужны: arm-none-eabi-gcc в PATH и собранная libopencm3
 # (OPENCM3_DIR, по умолчанию ~/.local/libopencm3).
@@ -27,7 +28,8 @@ endif
 
 ROOT        := ../..
 ifeq ($(CRYPTO),private)
-CRYPTO_SRC  := $(ROOT)/private/crypto.c
+CRYPTO_SRC  := $(wildcard $(ROOT)/private/*.c $(ROOT)/private/vendor/*/*.c)
+CRYPTO_INC  := $(addprefix -I,$(patsubst %/,%,$(wildcard $(ROOT)/private/vendor/*/)))
 else
 CRYPTO_SRC  := $(ROOT)/core/crypto_null.c
 endif
@@ -43,13 +45,17 @@ OBJCOPY := $(PREFIX)objcopy
 SIZE    := $(PREFIX)size
 
 CFLAGS  := -Os -g -std=c99 -Wall -Wextra -Werror -ffunction-sections -fdata-sections \
-           $(ARCH_FLAGS) $(genlink_cppflags) $(BOARD_DEFS) -I$(ROOT)/core -I$(OPENCM3_DIR)/include
+           $(ARCH_FLAGS) $(genlink_cppflags) $(BOARD_DEFS) -I$(ROOT)/core $(CRYPTO_INC) -I$(OPENCM3_DIR)/include
 LDFLAGS := -T$(LDSCRIPT) -nostartfiles $(ARCH_FLAGS) -Wl,--gc-sections \
            --specs=nano.specs --specs=nosys.specs -L$(OPENCM3_DIR)/lib
 LDLIBS  := -Wl,--start-group -l$(LIBNAME) -lc -lgcc -lnosys -Wl,--end-group
 
 all: $(OUT)/smess-lora.bin $(OUT)/smess-lora.hex
 	@$(SIZE) $(OUT)/smess-lora.elf
+ifeq ($(BOARD),bluepill)
+	@# последний килобайт F103C8 (0x0800FC00) — под секрет модуля защиты
+	@test $$(stat -c%s $(OUT)/smess-lora.bin) -le 64512 || { echo "прошивка залезла на страницу секрета"; exit 1; }
+endif
 
 $(OUT):
 	mkdir -p $@
@@ -74,9 +80,15 @@ else
 	st-flash --reset write $< 0x08000000
 endif
 
+# Защита чтения (RDP 1): программатором не считать ни прошивку, ни ключ.
+# Снять можно только со стиранием всего флеша.
+protect:
+	openocd -f interface/stlink.cfg -f target/$(if $(filter bluepill,$(BOARD)),stm32f1x,stm32f4x).cfg \
+	        -c "init; reset halt; $(if $(filter bluepill,$(BOARD)),stm32f1x,stm32f4x) lock 0; reset run; exit"
+
 clean:
 	rm -rf build-blackpill build-bluepill generated.*.ld
 
 include $(OPENCM3_DIR)/mk/genlink-rules.mk
 
-.PHONY: all flash clean
+.PHONY: all flash protect clean

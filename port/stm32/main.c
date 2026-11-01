@@ -10,11 +10,21 @@
  * На узле: Serial-модуль не нужен — работает обычный Serial API на его
  * USB/UART-консоли. В прошивках 2.5+ проверьте Security → Serial console = вкл.
  *
+ * Для модуля защиты (полная сборка) плата даёт шум АЦП как источник
+ * случайности (аппаратного ГСЧ у F411 и F103 нет) и одну страницу флеша под
+ * секрет: F103C8 — последний килобайт (0x0800FC00), F411 — сектор 7
+ * (0x08060000). Чтобы секрет нельзя было считать программатором, после
+ * прошивки включите защиту чтения: make protect.
+ *
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
+#include <string.h>
+
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/cm3/systick.h>
+#include <libopencm3/stm32/adc.h>
 #include <libopencm3/stm32/desig.h>
+#include <libopencm3/stm32/flash.h>
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/usart.h>
@@ -91,6 +101,86 @@ static uint32_t random32(void) {
     return x;
 }
 
+/* --- для модуля защиты: шум АЦП и страница флеша --- */
+
+#if defined(STM32F4)
+#define SECRET_ADDR 0x08060000u
+#define ADC_NOISE_CH 18 /* датчик температуры F411 */
+#else
+#define SECRET_ADDR 0x0800FC00u
+#define ADC_NOISE_CH ADC_CHANNEL_TEMP
+#endif
+
+static bool adc_ok;
+
+static void adc_setup(void) {
+    rcc_periph_clock_enable(RCC_ADC1);
+    adc_power_off(ADC1);
+#if defined(STM32F4)
+    adc_set_clk_prescale(ADC_CCR_ADCPRE_BY4);
+    adc_set_sample_time(ADC1, ADC_NOISE_CH, ADC_SMPR_SMP_3CYC);
+#else
+    rcc_set_adcpre(RCC_CFGR_ADCPRE_DIV6); /* 12 МГц: больше АЦП F103 не умеет */
+    adc_set_sample_time(ADC1, ADC_NOISE_CH, ADC_SMPR_SMP_1DOT5CYC);
+#endif
+    adc_disable_scan_mode(ADC1);
+    adc_set_single_conversion_mode(ADC1);
+    adc_disable_external_trigger_regular(ADC1);
+    adc_set_right_aligned(ADC1);
+    adc_enable_temperature_sensor();
+    uint8_t ch = ADC_NOISE_CH;
+    adc_set_regular_sequence(ADC1, 1, &ch);
+    adc_power_on(ADC1);
+    for (volatile int i = 0; i < 1000; i++) { /* АЦП просыпается несколько мкс */
+    }
+    adc_ok = true;
+}
+
+/* Самое короткое время выборки — младшие биты почти чистый шум. */
+static uint32_t adc_sample(void) {
+    if (!adc_ok) return 0;
+#if defined(STM32F4)
+    adc_start_conversion_regular(ADC1);
+#else
+    adc_start_conversion_direct(ADC1);
+#endif
+    for (int t = 0; t < 2000; t++)
+        if (adc_eoc(ADC1)) return adc_read_regular(ADC1);
+    adc_ok = false; /* АЦП не отвечает (бывает в эмуляторе) — дальше без него */
+    return 0;
+}
+
+static void entropy(uint8_t *buf, size_t n) {
+    uint32_t uid[3];
+    desig_get_unique_id(uid);
+    for (size_t i = 0; i < n; i++) {
+        uint32_t x = uid[i % 3] ^ STK_CVR ^ (ms << 16);
+        for (int k = 0; k < 8; k++) x = (x << 5 | x >> 27) ^ adc_sample() ^ STK_CVR;
+        buf[i] = (uint8_t)(x ^ x >> 8 ^ x >> 16 ^ x >> 24);
+    }
+}
+
+static bool secret_load(uint8_t *buf, size_t n) {
+    memcpy(buf, (const void *)SECRET_ADDR, n);
+    return true; /* целостность проверит модуль: стёртый флеш — это FF */
+}
+
+static bool secret_store(const uint8_t *buf, size_t n) {
+    flash_unlock();
+#if defined(STM32F4)
+    flash_erase_sector(7, FLASH_CR_PROGRAM_X32);
+#else
+    flash_erase_page(SECRET_ADDR);
+#endif
+    for (size_t i = 0; i < n; i += 4) {
+        uint32_t w = 0xFFFFFFFFu;
+        memcpy(&w, buf + i, n - i < 4 ? n - i : 4);
+        flash_program_word(SECRET_ADDR + i, w);
+    }
+    flash_lock();
+    return !memcmp((const void *)SECRET_ADDR, buf, n);
+}
+
 static void usart_setup(uint32_t usart) {
     usart_set_baudrate(usart, 115200);
     usart_set_databits(usart, 8);
@@ -140,18 +230,24 @@ static void hw_setup(void) {
     desig_get_unique_id(uid);
     rng_state = uid[0] ^ (uid[1] * 2654435761u) ^ (uid[2] << 7) ^ 0x9E3779B9u;
     if (!rng_state) rng_state = 0xA5A5A5A5u;
+
+    adc_setup();
 }
 
 int main(void) {
     hw_setup();
 
-    static const smess_platform plat = { radio_write, console_write, millis, random32, NULL, true };
+    static const smesh_crypto_platform cp = { entropy, secret_load, secret_store, NULL };
+    static const smess_platform plat = { radio_write, console_write, millis, random32, NULL, true, &cp };
     app_init(&plat);
 
     for (;;) {
         int b;
         while ((b = ring_get(&radio_rx)) >= 0) app_radio_byte((uint8_t)b);
-        while ((b = ring_get(&console_rx)) >= 0) app_console_char((char)b);
+        while ((b = ring_get(&console_rx)) >= 0) {
+            smesh_crypto_stir(STK_CVR); /* время нажатий с точностью до такта */
+            app_console_char((char)b);
+        }
         app_poll();
 
         /* PC13 включается нулём */

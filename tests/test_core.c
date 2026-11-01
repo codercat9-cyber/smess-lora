@@ -227,7 +227,7 @@ static void type_line(const char *s) {
 }
 
 static void test_app(void) {
-    static const smess_platform plat = { fake_radio_write, fake_console, fake_millis, fake_rand, NULL, false };
+    static const smess_platform plat = { fake_radio_write, fake_console, fake_millis, fake_rand, NULL, false, NULL };
     const uint32_t ME = 0xA1B2C3D4, PEER = 0x0BADF00D;
     toradio tr[16];
 

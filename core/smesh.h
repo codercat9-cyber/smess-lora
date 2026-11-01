@@ -14,7 +14,7 @@
  *   19..   тело
  *
  * Адрес — непрозрачные 6 байт. Без ключей это номер узла Meshtastic
- * (00 00 + номер BE); с закрытым модулем — отпечаток открытого ключа.
+ * (00 00 + номер BE); с закрытым модулем — производный от ключа.
  * Маршрут, повторы в эфире и ключ канала — забота Meshtastic.
  *
  * SPDX-License-Identifier: AGPL-3.0-or-later
@@ -49,7 +49,15 @@ typedef struct {
     uint8_t b[6];
 } smesh_addr;
 
-enum { SMESH_T_TEXT = 1 };
+/* Типы содержимого. CTRL и всё с битом SEALED — забота модуля защиты
+ * (smesh_crypto.h); 2 (сообщение чата) шлёт мессенджер, плата его только
+ * показывает. */
+enum {
+    SMESH_T_TEXT = 1,
+    SMESH_T_CHAT = 2,
+    SMESH_T_CTRL = 3,
+    SMESH_T_SEALED = 0x08,
+};
 
 typedef struct {
     uint8_t type;

@@ -2,8 +2,10 @@
  * Тот же клиент, что на STM32, но на Linux: узел Meshtastic по USB,
  * консоль — терминал. Нужен, чтобы гонять ядро на живом узле без платы.
  *
- *   ./build/smess-lora [-v] [/dev/ttyUSB0]
+ *   ./build/smess-lora [-v] [-k файл] [/dev/ttyUSB0]
  *   -v — показывать текстовый журнал узла
+ *   -k — где держать свой ключ (по умолчанию ~/.config/smess-lora/key,
+ *        права 600; в открытой сборке не нужен)
  *
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
@@ -14,6 +16,7 @@
 #include <string.h>
 #include <sys/random.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -54,6 +57,50 @@ static uint32_t random32(void) {
     return v;
 }
 
+/* --- для модуля защиты: случайность ядра и файл ключа --- */
+
+static char key_path[512];
+
+static void entropy(uint8_t *buf, size_t n) {
+    while (n) {
+        ssize_t r = getrandom(buf, n, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            perror("getrandom");
+            exit(1);
+        }
+        buf += r;
+        n -= (size_t)r;
+    }
+}
+
+static bool secret_load(uint8_t *buf, size_t n) {
+    FILE *f = fopen(key_path, "rb");
+    if (!f) return false;
+    bool ok = fread(buf, 1, n, f) == n;
+    fclose(f);
+    return ok;
+}
+
+static bool secret_store(const uint8_t *buf, size_t n) {
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s", key_path);
+    char *sl = strrchr(dir, '/');
+    if (sl && sl != dir) {
+        *sl = 0;
+        mkdir(dir, 0700); /* ~/.config/smess-lora; есть — не страшно */
+    }
+    char tmp[600];
+    snprintf(tmp, sizeof tmp, "%s.tmp", key_path);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return false;
+    bool ok = write(fd, buf, n) == (ssize_t)n && fsync(fd) == 0;
+    close(fd);
+    if (ok) ok = rename(tmp, key_path) == 0;
+    if (!ok) unlink(tmp);
+    return ok;
+}
+
 static void radio_log(uint8_t b) {
     if (verbose) fputc(b, stderr);
 }
@@ -76,8 +123,11 @@ static int open_serial(const char *path) {
 
 int main(int argc, char **argv) {
     const char *port = "/dev/ttyUSB0";
+    const char *home = getenv("HOME");
+    snprintf(key_path, sizeof key_path, "%s/.config/smess-lora/key", home ? home : ".");
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v")) verbose = 1;
+        else if (!strcmp(argv[i], "-k") && i + 1 < argc) snprintf(key_path, sizeof key_path, "%s", argv[++i]);
         else port = argv[i];
     }
     radio_fd = open_serial(port);
@@ -89,7 +139,8 @@ int main(int argc, char **argv) {
     usleep(2500 * 1000);
     tcflush(radio_fd, TCIFLUSH);
 
-    static const smess_platform plat = { radio_write, console_write, millis, random32, radio_log, false };
+    static const smesh_crypto_platform cp = { entropy, secret_load, secret_store, NULL };
+    static const smess_platform plat = { radio_write, console_write, millis, random32, radio_log, false, &cp };
     app_init(&plat);
 
     for (;;) {
